@@ -126,10 +126,8 @@ class Waypoint(Node):
             self.get_logger().info('Goal reached successfully!')
         else:
             self.get_logger().warn('Navigation failed')
-        # optionally keep node alive for next goal or shutdown
-        # rclpy.shutdown()
 
-    # ---------------- Helper function ----------------
+    # ---------------- Calculating function ----------------
     def gps_to_xy(self, lat1, lon1, lat2, lon2):
         R = 6371e3
         phi1 = math.radians(lat1)
