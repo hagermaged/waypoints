@@ -1,6 +1,5 @@
 # Goal
-float64 latitude
-float64 longitude
+string command
 
 ---
 # Result

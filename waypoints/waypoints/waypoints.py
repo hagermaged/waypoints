@@ -1,6 +1,6 @@
 import rclpy
 from rclpy.node import Node
-from rclpy.action import ActionClient
+from rclpy.action import ActionServer
 from sensor_msgs.msg import NavSatFix
 from geometry_msgs.msg import Twist
 from gps_interfaces.action import NavigateToGPS
@@ -10,13 +10,13 @@ import math
 class Waypoint(Node):
 
     def __init__(self):
-        super().__init__('waypoint_client')
+        super().__init__('waypoint')
 
         self.lat = None
         self.long = None
         self.current_yaw = 0.0
 
-        # Read goal coordinates from file
+        # Read goal from file
         self.goal_lat, self.goal_long = self.read_waypoint_from_file('waypoint.txt')
         self.get_logger().info(f'Goal loaded: lat={self.goal_lat}, lon={self.goal_long}')
 
@@ -24,18 +24,12 @@ class Waypoint(Node):
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
 
         # Subscribe to GPS
-        self.create_subscription(
-            NavSatFix,
-            '/gps',
-            self.gps_callback,
-            10
-        )
+        self.create_subscription(NavSatFix, '/gps', self.gps_callback, 10)
 
-        # Create the action client
-        self._action_client = ActionClient(self, NavigateToGPS, 'navigate_to_gps')
+        # Create the action server
+        self._action_server = ActionServer(self, NavigateToGPS,'navigate_to_gps',self.execute_callback)
 
-        # Send the goal to the server
-        self.send_goal()
+        self.get_logger().info('Action server is up and waiting for commands...')
 
     # ---------------- File reading ----------------
     def read_waypoint_from_file(self, filename):
@@ -44,112 +38,101 @@ class Waypoint(Node):
                 lat = float(f.readline().strip())
                 lon = float(f.readline().strip())
             return lat, lon
-        except FileNotFoundError:
-            self.get_logger().error(f'File {filename} not found!')
-            return None, None
-        except ValueError:
-            self.get_logger().error(f'Invalid format in {filename}')
+        except (FileNotFoundError, ValueError):
+            self.get_logger().error(f'Error reading {filename}')
             return None, None
 
     # ---------------- GPS callback ----------------
     def gps_callback(self, msg):
-        if self.goal_lat is None or self.goal_long is None:
-            self.get_logger().warn('Goal coordinates not loaded, skipping calculation')
-            return
-
         self.lat = msg.latitude
         self.long = msg.longitude
-        self.get_logger().info(f'Current GPS: lat={self.lat}, lon={self.long}')
 
-        x, y = self.gps_to_xy(self.lat, self.long, self.goal_lat, self.goal_long)
-        self.get_logger().info(f'Relative position to goal: x={x:.2f} m, y={y:.2f} m')
+    # ---------------- Action server ----------------
+    def execute_callback(self, goal_handle):
+        command = goal_handle.request.command
+        self.get_logger().info(f'Received command: {command}')
 
-        #  Move rover toward target
-        distance = math.sqrt(x*x + y*y)
-        target_angle = math.atan2(y, x)
-        angle_error = target_angle - self.current_yaw
-        angle_error = math.atan2(math.sin(angle_error), math.cos(angle_error))
+        if command.lower() != 'go':
+            self.get_logger().warn('Unknown command')
+            goal_handle.abort()
+            result = NavigateToGPS.Result()
+            result.success = False
+            return result
 
-        cmd = Twist()
-        if distance > 1.0:   # stop tolerance (1 meter)
-            if abs(angle_error) > 0.1:
-                cmd.linear.x = 0.0
-                cmd.angular.z = 0.3 if angle_error > 0 else -0.3
-            else:
-                cmd.linear.x = 0.5
-                cmd.angular.z = 0.0
-        else:
-            cmd.linear.x = 0.0
-            cmd.angular.z = 0.0
-            self.get_logger().info("Goal reached!")
-
-        self.cmd_pub.publish(cmd)
-
-    # ---------------- Action client ----------------
-    def send_goal(self):
         if self.goal_lat is None or self.goal_long is None:
-            self.get_logger().warn('No goal loaded, cannot send')
-            return
+            self.get_logger().error('No waypoint loaded')
+            goal_handle.abort()
+            result = NavigateToGPS.Result()
+            result.success = False
+            return result
 
-        self.get_logger().info('Waiting for action server...')
-        self._action_client.wait_for_server()
+        self.get_logger().info(f'Starting navigation to lat={self.goal_lat}, lon={self.goal_long}')
 
-        goal_msg = NavigateToGPS.Goal()
-        goal_msg.latitude = self.goal_lat
-        goal_msg.longitude = self.goal_long
+        feedback_msg = NavigateToGPS.Feedback()
+        result = NavigateToGPS.Result()
 
-        self.get_logger().info(f'Sending goal to server: lat={goal_msg.latitude}, lon={goal_msg.longitude}')
+        # Timer for periodic navigation
+        def navigate_step():
+            if self.lat is None or self.long is None:
+                self.get_logger().info('Waiting for GPS fix...')
+                return
 
-        self._send_goal_future = self._action_client.send_goal_async(
-            goal_msg,
-            feedback_callback=self.feedback_callback
-        )
-        self._send_goal_future.add_done_callback(self.goal_response_callback)
+            # Calculate distance and angle
+            x, y = self.gps_to_xy(self.lat, self.long, self.goal_lat, self.goal_long)
+            distance = math.sqrt(x*x + y*y)
+            target_angle = math.atan2(y, x)
+            angle_error = math.atan2(math.sin(target_angle - self.current_yaw),
+                                     math.cos(target_angle - self.current_yaw))
 
-    def goal_response_callback(self, future):
-        goal_handle = future.result()
-        if not goal_handle.accepted:
-            self.get_logger().warn('Goal rejected by server')
-            return
+            # Send feedback
+            feedback_msg.distance_remaining = distance
+            goal_handle.publish_feedback(feedback_msg)
+            self.get_logger().info(f'Distance remaining: {distance:.2f} m')
 
-        self.get_logger().info('Goal accepted by server')
-        self._get_result_future = goal_handle.get_result_async()
-        self._get_result_future.add_done_callback(self.result_callback)
+            # Move robot
+            cmd = Twist()
+            if distance > 1.0:
+                if abs(angle_error) > 0.1:
+                    cmd.linear.x = 0.0
+                    cmd.angular.z = 0.3 if angle_error > 0 else -0.3
+                else:
+                    cmd.linear.x = 0.5
+                    cmd.angular.z = 0.0
+            else:
+                cmd.linear.x = 0.0
+                cmd.angular.z = 0.0
+                self.get_logger().info('Goal reached!')
+                goal_handle.succeed()
+                result.success = True
+                self.nav_timer.cancel()  # stop timer
 
-    def feedback_callback(self, feedback_msg):
-        distance = feedback_msg.feedback.distance_remaining
-        self.get_logger().info(f'Distance remaining: {distance:.2f} m')
+            self.cmd_pub.publish(cmd)
 
-    def result_callback(self, future):
-        result = future.result().result
-        if result.success:
-            self.get_logger().info('Goal reached successfully!')
-        else:
-            self.get_logger().warn('Navigation failed')
+        # Start timer to check GPS and move every 0.5 sec
+        self.nav_timer = self.create_timer(0.5, navigate_step)
 
-    # ---------------- Calculating function ----------------
+        # Keep action alive until it succeeds
+        while not goal_handle.is_cancel_requested and not result.success:
+            rclpy.spin_once(self, timeout_sec=0.1)
+
+        if not result.success:
+            goal_handle.abort()
+            result.success = False
+
+        return result
+
+    # ---------------- GPS to XY ----------------
     def gps_to_xy(self, lat1, lon1, lat2, lon2):
         R = 6371e3
-        phi1 = math.radians(lat1)
-        phi2 = math.radians(lat2)
-        dphi = math.radians(lat2 - lat1)
-        dlambda = math.radians(lon2 - lon1)
-
-        a = (math.sin(dphi/2) ** 2 +
-             math.cos(phi1) * math.cos(phi2) *
-             math.sin(dlambda/2) ** 2)
-        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-        distance = R * c
-
-        y_angle = math.sin(dlambda) * math.cos(phi2)
-        x_angle = (math.cos(phi1) * math.sin(phi2) -
-                   math.sin(phi1) * math.cos(phi2) * math.cos(dlambda))
+        phi1, phi2 = math.radians(lat1), math.radians(lat2)
+        dphi, dlambda = math.radians(lat2-lat1), math.radians(lon2-lon1)
+        a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
+        c = 2*math.atan2(math.sqrt(a), math.sqrt(1-a))
+        distance = R*c
+        y_angle = math.sin(dlambda)*math.cos(phi2)
+        x_angle = math.cos(phi1)*math.sin(phi2) - math.sin(phi1)*math.cos(phi2)*math.cos(dlambda)
         theta = math.atan2(y_angle, x_angle)
-
-        dx = distance * math.sin(theta)
-        dy = distance * math.cos(theta)
-
-        return dx, dy
+        return distance*math.sin(theta), distance*math.cos(theta)
 
 
 def main(args=None):
