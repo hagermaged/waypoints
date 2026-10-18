@@ -1,0 +1,12 @@
+# Goal
+float64 latitude
+float64 longitude
+---
+# Result
+bool success
+string reason
+---
+# Feedback
+float64 current_latitude
+float64 current_longitude
+float64 distance_remaining

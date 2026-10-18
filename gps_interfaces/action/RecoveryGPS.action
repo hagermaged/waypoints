@@ -1,0 +1,11 @@
+#Goal
+string reason
+float64 target_lat
+float64 target_lon
+---
+#Result
+bool success
+string reason
+---
+#Feedback
+string current_status

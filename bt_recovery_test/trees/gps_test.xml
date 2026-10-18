@@ -1,0 +1,16 @@
+<root BTCPP_format="4">
+
+  <BehaviorTree ID="GoToWaypoint">
+    <RecoveryNode number_of_retries="3">
+      <GpsNav      waypoint_lat="{lat}" waypoint_lon="{lon}" fail_reason="{reason}"/>
+      <GpsRecovery target_lat="{lat}"   target_lon="{lon}"   reason="{reason}"/>
+    </RecoveryNode>
+  </BehaviorTree>
+
+  <BehaviorTree ID="TestTree">
+    <Sequence>
+      <SubTree ID="GoToWaypoint" lat="31.2001" lon="29.9187"/>
+    </Sequence>
+  </BehaviorTree>
+
+</root>
